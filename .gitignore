@@ -1,0 +1,17 @@
+.venv
+.idea 
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pywzc
+*.pywc
+*.pyzc
+*.pywc
+*.pyzc
+*.pywc
+*.pyzc

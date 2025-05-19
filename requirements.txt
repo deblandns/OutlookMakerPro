@@ -1,0 +1,7 @@
+playwright
+Faker
+loguru
+fake-useragent
+patchright
+playwright-stealth
+tenacity 
