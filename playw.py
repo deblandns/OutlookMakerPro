@@ -4,12 +4,15 @@ from faker import Faker
 from loguru import logger
 from fake_useragent import FakeUserAgent
 from patchright.async_api import async_playwright
-from playwright_stealth import stealth_async
+# from playwright_stealth import stealth_async # Removed
 import string
 import secrets
 import asyncio # Ensure asyncio is imported at the top
 from tenacity import retry as tenacity_retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+import openpyxl
+from openpyxl import Workbook
+from openpyxl.utils.exceptions import InvalidFileException # For checking if file is valid excel
 
 # the logger configs
 info_log = logger.info
@@ -22,6 +25,69 @@ warning_log = logger.warning
 dir_path = os.path.dirname(os.path.abspath(__file__))
 name_file = os.path.join(dir_path, "usersdata/names.txt")
 family_file = os.path.join(dir_path, "usersdata/family.txt")
+
+# Excel configuration
+EXCEL_FILE_NAME = "created_outlook_accounts.xlsx"
+EXCEL_HEADERS = ["Email", "Password", "First Name", "Last Name", "Birth Date"]
+
+def save_account_to_excel(email, password, first_name, last_name, birth_date_str):
+    workbook = None
+    sheet = None
+    file_exists_and_is_accessible = os.path.exists(EXCEL_FILE_NAME) and os.access(EXCEL_FILE_NAME, os.W_OK)
+
+    try:
+        if file_exists_and_is_accessible:
+            try:
+                workbook = openpyxl.load_workbook(EXCEL_FILE_NAME)
+                sheet = workbook.active
+            except InvalidFileException:
+                info_log(f"{EXCEL_FILE_NAME} is not a valid Excel file or is corrupted. Creating a new one.")
+                os.remove(EXCEL_FILE_NAME) # Attempt to remove corrupted file
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.append(EXCEL_HEADERS)
+            except Exception as e: # Other errors during load (e.g. file locked)
+                error_log(f"Could not load {EXCEL_FILE_NAME}: {e}. Will try to create new if it was removed or write to a new one.")
+                # If removal failed or wasn't attempted, try creating a new one.
+                if not os.path.exists(EXCEL_FILE_NAME): # If it was removed or never existed
+                    workbook = Workbook()
+                    sheet = workbook.active
+                    sheet.append(EXCEL_HEADERS)
+                else: # File still exists but couldn't be loaded, avoid overwriting potentially good data with just headers
+                    error_log(f"Cannot proceed with saving to {EXCEL_FILE_NAME} due to load error and file still existing.")
+                    return # Exit if we can't be sure about the sheet's state
+        else: # File does not exist or is not writable
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(EXCEL_HEADERS)
+
+        # Ensure sheet is valid and headers are present if it's an existing sheet
+        if sheet is not None and sheet.max_row > 0:
+            current_headers = [sheet.cell(row=1, column=i+1).value for i in range(len(EXCEL_HEADERS))]
+            if current_headers != EXCEL_HEADERS:
+                # This case is tricky: headers mismatch. Could be a different file.
+                # For simplicity, we'll append, but ideally, this might need more sophisticated handling or a new sheet/file.
+                warning_log(f"Header mismatch in {EXCEL_FILE_NAME}. Appending data anyway.")
+                if sheet.max_row == 1 and all(c is None for c in current_headers): # Empty first row
+                    for i, header_text in enumerate(EXCEL_HEADERS):
+                        sheet.cell(row=1, column=i + 1, value=header_text)
+        elif sheet is not None and (sheet.max_row == 0 or sheet.cell(row=1, column=1).value is None): # Sheet is empty or first cell is empty
+             sheet.append(EXCEL_HEADERS)
+
+
+        if sheet is None: # If sheet could not be initialized
+            error_log(f"Failed to obtain a valid sheet in {EXCEL_FILE_NAME}. Cannot save account.")
+            return
+
+        sheet.append([email, password, first_name, last_name, birth_date_str])
+        workbook.save(EXCEL_FILE_NAME)
+        success_log(f"Successfully saved account {email} to {EXCEL_FILE_NAME}")
+
+    except PermissionError:
+        error_log(f"Permission denied when trying to save {EXCEL_FILE_NAME}. Make sure the file is not open in Excel or another program and you have write permissions.")
+    except Exception as e:
+        error_log(f"An unexpected error occurred while saving to Excel: {e}")
+
 
 # function to get the random name and family
 def get_random_data():
@@ -169,15 +235,23 @@ async def main():
     async with async_playwright() as p:
         info_log("Starting the browser")
         # this code will open the browser and go to the signup page
-        browser = await p.chromium.launch(headless=False)
-        # Create a new browser context with the random user agent
-        context = await browser.new_context(user_agent=FakeUserAgent().random)
+        browser = await p.chromium.launch(headless=False) # Removed args=launch_args to use patchright defaults
+
+        # Define common viewport sizes
+        common_viewports = [{'width': 1920, 'height': 1080}, {'width': 1366, 'height': 768}, {'width': 1280, 'height': 720}, {'width': 1600, 'height': 900}, {'width': 1440, 'height': 900}, {'width': 1280, 'height': 800}, {'width': 1280, 'height': 1024},{'width': 1024, 'height': 768}]
+        # Select a random viewport
+        random_viewport = random.choice(common_viewports)
+        info_log(f"Setting random viewport: {random_viewport['width']}x{random_viewport['height']}")
+
+        context = await browser.new_context(user_agent=FakeUserAgent().random, viewport=random_viewport)
+        # await context.add_init_script(init_script) # Ensure it runs on every new document
+
         page = await context.new_page()
-        await stealth_async(page)
+        # await stealth_async(page) # Removed
 
         # Intercept network requests to block images, media, fonts, and stylesheets
         async def handle_route(route):
-            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+            if route.request.resource_type in ["image", "media"]: # Allow fonts and stylesheets
                 await route.abort()
             else:
                 await route.continue_()
@@ -187,12 +261,12 @@ async def main():
         try: # this code will try to go to the signup page
             await robust_goto(page, "https://signup.live.com/signup")
         except Exception as e:
-            error_log(f"Error: {e}")
+            error_log(f"Error navigating to signup page: {e}")
             await browser.close()
             return
         # input the email to the first page
         random_data = get_random_data()
-        email_input_selector = "#floatingLabelInput5"
+        email_input_selector = 'input[aria-label="Email"]'
         email_input = page.locator(email_input_selector)
         info_log(f"Attempting to find email input with selector: {email_input_selector}")
         # this code will try to input the email to the first page
@@ -244,15 +318,15 @@ async def main():
             password_selector = 'input[type="password"][autocomplete="new-password"]'
             await robust_wait_for_selector(page, password_selector, timeout=20000) # Wait up to 20s
             password_input_locator = page.locator(password_selector)
-            password = generate_strong_password()
+            password_to_save = generate_strong_password() # Assign the generated password
             info_log("Hovering over the password input.")
             await robust_hover(page, password_input_locator, timeout=5000)
             info_log("Clicking the password input.")
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_click(password_input_locator, timeout=5000)
-            info_log(f"Attempting to type password: {password}")
+            info_log(f"Attempting to type password...") # Removed password from log for security
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_type(password_input_locator, text=password, delay=random.uniform(90, 300), timeout=15000)
+            await robust_type(password_input_locator, text=password_to_save, delay=random.uniform(90, 300), timeout=15000) # Use password_to_save
             next_button_password_selector = "[data-testid='primaryButton']"
             next_button_password = page.locator(next_button_password_selector)
             await asyncio.sleep(random.uniform(1.0, 3.0))
@@ -370,7 +444,6 @@ async def main():
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_type(last_name_input_locator, text=user_last_name, delay=random.uniform(90, 250))
             success_log(f"Successfully inputted last name: {user_last_name}")
-
             # Click the Next button after name input
             info_log("Attempting to find the 'Next' button after name input.")
             next_button_name_selector = "[data-testid='primaryButton']"
@@ -382,16 +455,70 @@ async def main():
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_click(next_button_name, timeout=5000)
             success_log("Successfully clicked the 'Next' button after name input.")
+            # the section for the captcha
+            info_log("SCRIPT PAUSED: Please solve the CAPTCHA now in the browser window.")
+            info_log("The script will wait indefinitely for the page to navigate after you solve the CAPTCHA...")
+            # check if the page is loaded
+            try:
+                # Wait indefinitely for navigation to complete after manual CAPTCHA solving.
+                # 'load' ensures the next page is reasonably loaded before proceeding.
+                await page.wait_for_load_state('load', timeout=0) # Changed from page.wait_for_navigation
+                success_log("CAPTCHA appears to be solved (navigation detected). Checking current page...")
+            except PlaywrightTimeoutError: 
+                # This should ideally not happen with timeout=0, but included for robustness.
+                error_log("Timeout unexpectedly occurred while waiting for navigation after manual CAPTCHA.")
+                return # Exit this attempt
+            except Exception as e_nav:
+                error_log(f"An error occurred while waiting for navigation after manual CAPTCHA: {e_nav}")
+                return # Exit this attempt
+
+            # --- Check for privacy notice page (or other outcomes) AFTER manual CAPTCHA ---
+            current_url = page.url
+            page_title = await page.title()
+            info_log(f"Landed on URL: {current_url} - Title: {page_title} (after manual CAPTCHA)")
+
+            if "privacynotice.account.microsoft.com" in current_url:
+                info_log("Microsoft account notice page detected. Preparing to save details and click OK.")
+                if password_to_save and random_data:
+                    email_full = f"{random_data['email_username']}@outlook.com"
+                    birth_date_str = random_data['birth_date'].strftime('%Y-%m-%d')
+                    save_account_to_excel(email_full, password_to_save, random_data['first_name'], random_data['last_name'], birth_date_str)
+                else:
+                    error_log("Missing password or random_data, cannot save account details to Excel.")
+
+                ok_button_locator = page.get_by_role("button", name="OK")
+                # Fallback selector if get_by_role doesn't work: page.locator("button:has-text('OK')")
+                if await ok_button_locator.is_visible(timeout=10000):
+                    info_log("Clicking 'OK' on the Microsoft account notice page.")
+                    await robust_hover(page, ok_button_locator, timeout=5000) # Hover before click
+                    await robust_click(ok_button_locator)
+                    # Wait for page to potentially change/settle after clicking OK
+                    try:
+                        await robust_wait_for_load_state(page, 'domcontentloaded', timeout=10000)
+                        success_log("Successfully clicked 'OK' and notice page processed.")
+                    except PlaywrightTimeoutError:
+                        info_log("Page did not fully reload or change after clicking OK on notice, but proceeding.")
+                    except Exception as e_load:
+                        warning_log(f"Error waiting for load state after clicking OK on notice: {e_load}. Proceeding.")
+                else:
+                    warning_log("'OK' button not found on the notice page. Trying to proceed.")
+                    await page.screenshot(path=f"notice_ok_button_not_found_{random_data.get('email_username', 'unknown')}.png")
+            
+            elif "account.microsoft.com" in current_url and "verify" in current_url.lower():
+                 warning_log(f"Landed on a verification page unexpectedly after names: {current_url}. This might indicate CAPTCHA or other challenge.")
+
+            else:
+                warning_log(f"Did not land on the expected Microsoft account notice page. Current URL: {current_url}, Title: {page_title}")
+
         except Exception as e:
-            error_log(f"Error interacting with name and family input: {e}")
+            error_log(f"Error interacting with name and family input OR on the subsequent notice/final page: {e}")
+        finally:
+            info_log("Account creation attempt finished for this iteration. Closing browser.")
+            await page.wait_for_timeout(3000) # Brief pause before closing browser.
             await browser.close()
-            return
-        await page.wait_for_timeout(500000)
-        # finally it will close when everything is done
-        await browser.close()
+            # No explicit return needed here, end of function implies return
 
 # this code will run the main function
 if __name__ == "__main__":
     # import asyncio # asyncio already imported at the top
     asyncio.run(main())
-
