@@ -455,27 +455,77 @@ async def main():
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_click(next_button_name, timeout=5000)
             success_log("Successfully clicked the 'Next' button after name input.")
-            # the section for the captcha
-            info_log("SCRIPT PAUSED: Please solve the CAPTCHA now in the browser window.")
-            info_log("The script will wait indefinitely for the page to navigate after you solve the CAPTCHA...")
-            # check if the page is loaded
-            try:
-                # Wait indefinitely for navigation to complete after manual CAPTCHA solving.
-                # 'load' ensures the next page is reasonably loaded before proceeding.
-                await page.wait_for_load_state('load', timeout=0) # Changed from page.wait_for_navigation
-                success_log("CAPTCHA appears to be solved (navigation detected). Checking current page...")
-            except PlaywrightTimeoutError: 
-                # This should ideally not happen with timeout=0, but included for robustness.
-                error_log("Timeout unexpectedly occurred while waiting for navigation after manual CAPTCHA.")
-                return # Exit this attempt
-            except Exception as e_nav:
-                error_log(f"An error occurred while waiting for navigation after manual CAPTCHA: {e_nav}")
-                return # Exit this attempt
+            
+            # --- Enhanced CAPTCHA Detection ---
+            info_log("Checking for CAPTCHA page...")
+            # Option 1: Check for the "Solve puzzle" button (already in your code, made more robust)
+            solve_puzzle_button = page.get_by_role("button", name="Solve puzzle")
+            # Option 2: Check for the Arkose Labs iframe
+            captcha_iframe_selector = "iframe[data-testid='enforcementFrame']" # As seen in data.html
+            captcha_iframe = page.locator(captcha_iframe_selector)
 
-            # --- Check for privacy notice page (or other outcomes) AFTER manual CAPTCHA ---
+            # Give the page a moment to fully render CAPTCHA elements if they are appearing
+            await page.wait_for_timeout(10000) # 10 seconds, adjust if needed
+
+            is_captcha_visible = False
+            try:
+                if await solve_puzzle_button.is_visible(timeout=5000): # Check if button is visible within 5s
+                    is_captcha_visible = True
+                    info_log("CAPTCHA detected: 'Solve puzzle' button is visible.")
+                elif await captcha_iframe.is_visible(timeout=5000): # Check if iframe is visible within 5s
+                    is_captcha_visible = True
+                    info_log("CAPTCHA detected: Arkose Labs iframe is visible.")
+                elif await page.locator("h2:has-text('Let\\'s prove you\\'re human')").is_visible(timeout=3000):
+                    is_captcha_visible = True
+                    info_log("CAPTCHA detected: 'Let\\'s prove you\\'re human' heading is visible.")
+                else:
+                    # As a fallback, check if the iframe exists in the DOM, even if not immediately visible
+                    if await captcha_iframe.count() > 0:
+                        is_captcha_visible = True
+                        warning_log("CAPTCHA potentially present: Arkose Labs iframe found in DOM, but might not be visible yet.")
+                    else:
+                        info_log("No clear CAPTCHA elements detected within timeout.")
+            except PlaywrightTimeoutError:
+                info_log("Timeout while checking for CAPTCHA elements. Assuming no CAPTCHA or page not loaded as expected.")
+            except Exception as e_captcha_check:
+                error_log(f"Error during CAPTCHA check: {e_captcha_check}")
+
+
+            if is_captcha_visible:
+                info_log("CAPTCHA page is loaded.")
+                info_log("SCRIPT PAUSED: Please solve the CAPTCHA now in the browser window.")
+                info_log("The script will wait indefinitely for the page to navigate after you solve the CAPTCHA...")
+                # Wait indefinitely for navigation to complete after manual CAPTCHA solving.
+                try:
+                    await page.wait_for_load_state('load', timeout=0) # timeout=0 means indefinite
+                    success_log("CAPTCHA appears to be solved (navigation detected). Waiting for notice page content.") # Updated log
+
+                    # Wait for the "OK" button on the account notice page to become visible
+                    notice_page_ok_button = page.get_by_role("button", name="OK")
+                    info_log("Waiting for the 'OK' button on the account notice page to become visible (up to 60s).")
+                    try:
+                        await notice_page_ok_button.wait_for(state="visible", timeout=120000) # Wait up to 60 seconds
+                        success_log("'OK' button on notice page is visible.")
+                    except PlaywrightTimeoutError:
+                        error_log("Timeout (60s) waiting for 'OK' button on the notice page after CAPTCHA. Page may not have loaded as expected.")
+                    success_log("Proceeding to check current page after waiting for potential notice page content.") # Updated log
+                except PlaywrightTimeoutError: 
+                    error_log("Timeout unexpectedly occurred while waiting for navigation after manual CAPTCHA (this shouldn\'t happen with timeout=0).")
+                    await browser.close() # Ensure browser is closed
+                    return 
+                except Exception as e_nav:
+                    error_log(f"An error occurred while waiting for navigation or notice page content after manual CAPTCHA: {e_nav}")
+                    await browser.close() # Ensure browser is closed
+                    return
+            else:
+                info_log("CAPTCHA page not detected. Proceeding as if no CAPTCHA was presented.")
+                # If no CAPTCHA, you might land directly on the notice page or elsewhere.
+                # The script will proceed to the post-CAPTCHA logic.
+
+            # --- Check for privacy notice page (or other outcomes) AFTER manual CAPTCHA or if no CAPTCHA ---
             current_url = page.url
             page_title = await page.title()
-            info_log(f"Landed on URL: {current_url} - Title: {page_title} (after manual CAPTCHA)")
+            info_log(f"Landed on URL: {current_url} - Title: {page_title} (after CAPTCHA/name input)")
 
             if "privacynotice.account.microsoft.com" in current_url:
                 info_log("Microsoft account notice page detected. Preparing to save details and click OK.")
@@ -505,7 +555,7 @@ async def main():
                     await page.screenshot(path=f"notice_ok_button_not_found_{random_data.get('email_username', 'unknown')}.png")
             
             elif "account.microsoft.com" in current_url and "verify" in current_url.lower():
-                 warning_log(f"Landed on a verification page unexpectedly after names: {current_url}. This might indicate CAPTCHA or other challenge.")
+                 warning_log(f"Landed on a verification page unexpectedly: {current_url}. This might indicate an unsolved CAPTCHA or other challenge.")
 
             else:
                 warning_log(f"Did not land on the expected Microsoft account notice page. Current URL: {current_url}, Title: {page_title}")

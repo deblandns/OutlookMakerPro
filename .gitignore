@@ -15,3 +15,6 @@ __pycache__
 *.pyzc
 *.pywc
 *.pyzc
+.created_outlook_accounts.xlsx
+./created_outlook_accounts.xlsx
+created_outlook_accounts.xlsx
