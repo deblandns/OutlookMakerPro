@@ -55,7 +55,7 @@ def save_account_to_excel(email, password, first_name, last_name, birth_date_str
                     sheet.append(EXCEL_HEADERS)
                 else: # File still exists but couldn't be loaded, avoid overwriting potentially good data with just headers
                     error_log(f"Cannot proceed with saving to {EXCEL_FILE_NAME} due to load error and file still existing.")
-                    return # Exit if we can't be sure about the sheet's state
+                    raise # Propagate the error
         else: # File does not exist or is not writable
             workbook = Workbook()
             sheet = workbook.active
@@ -77,7 +77,7 @@ def save_account_to_excel(email, password, first_name, last_name, birth_date_str
 
         if sheet is None: # If sheet could not be initialized
             error_log(f"Failed to obtain a valid sheet in {EXCEL_FILE_NAME}. Cannot save account.")
-            return
+            raise # Propagate the error
 
         sheet.append([email, password, first_name, last_name, birth_date_str])
         workbook.save(EXCEL_FILE_NAME)
@@ -85,8 +85,10 @@ def save_account_to_excel(email, password, first_name, last_name, birth_date_str
 
     except PermissionError:
         error_log(f"Permission denied when trying to save {EXCEL_FILE_NAME}. Make sure the file is not open in Excel or another program and you have write permissions.")
+        raise # Propagate the error
     except Exception as e:
         error_log(f"An unexpected error occurred while saving to Excel: {e}")
+        raise # Propagate the error
 
 
 # function to get the random name and family
@@ -255,15 +257,13 @@ async def main():
                 await route.abort()
             else:
                 await route.continue_()
-        
         await page.route("**/*", handle_route)
 
         try: # this code will try to go to the signup page
             await robust_goto(page, "https://signup.live.com/signup")
         except Exception as e:
             error_log(f"Error navigating to signup page: {e}")
-            await browser.close()
-            return
+            raise # Propagate the error
         # input the email to the first page
         random_data = get_random_data()
         email_input_selector = 'input[aria-label="Email"]'
@@ -304,13 +304,11 @@ async def main():
                 error_log(f"Error waiting for page load state after clicking next: {e}")
                 # Potentially add a screenshot here for debugging if it fails often
                 # await page.screenshot(path="error_screenshot_pageload.png")
-                await browser.close()
-                return
+                raise # Propagate the error
 
         except Exception as e:
             error_log(f"Error interacting with email input: {e}")
-            await browser.close()
-            return
+            raise # Propagate the error
         # this code will try to insert the password to the second page
         try:
             info_log("Waiting for the password input to appear")
@@ -340,13 +338,11 @@ async def main():
                 success_log("Birth date page DOM content loaded.")
             except Exception as e:
                 error_log(f"Error waiting for birth date page load state: {e}")
-                await browser.close()
-                return
+                raise # Propagate the error
 
         except Exception as e:
             error_log(f"Error interacting with password input: {e}")
-            await browser.close()
-            return
+            raise # Propagate the error
         # give the mont, day, year and the region to the third page
         try:
             info_log("Waiting for the birth month dropdown to appear.")
@@ -408,13 +404,11 @@ async def main():
                 success_log("Name input page DOM content loaded.")
             except Exception as e:
                 error_log(f"Error waiting for name input page load state: {e}")
-                await browser.close()
-                return
+                raise # Propagate the error
 
         except Exception as e:
             error_log(f"Error interacting with birth date input: {e}")
-            await browser.close()
-            return
+            raise # Propagate the error
         # Input first name and last name for the next page
         try:
             info_log("Waiting for first name input to appear.")
@@ -508,15 +502,14 @@ async def main():
                         success_log("'OK' button on notice page is visible.")
                     except PlaywrightTimeoutError:
                         error_log("Timeout (60s) waiting for 'OK' button on the notice page after CAPTCHA. Page may not have loaded as expected.")
+                        raise # Propagate the error
                     success_log("Proceeding to check current page after waiting for potential notice page content.") # Updated log
                 except PlaywrightTimeoutError: 
-                    error_log("Timeout unexpectedly occurred while waiting for navigation after manual CAPTCHA (this shouldn\'t happen with timeout=0).")
-                    await browser.close() # Ensure browser is closed
-                    return 
+                    error_log("Timeout unexpectedly occurred while waiting for navigation after manual CAPTCHA (this shouldn't happen with timeout=0).")
+                    raise # Propagate the error 
                 except Exception as e_nav:
                     error_log(f"An error occurred while waiting for navigation or notice page content after manual CAPTCHA: {e_nav}")
-                    await browser.close() # Ensure browser is closed
-                    return
+                    raise # Propagate the error
             else:
                 info_log("CAPTCHA page not detected. Proceeding as if no CAPTCHA was presented.")
                 # If no CAPTCHA, you might land directly on the notice page or elsewhere.
@@ -535,6 +528,7 @@ async def main():
                     save_account_to_excel(email_full, password_to_save, random_data['first_name'], random_data['last_name'], birth_date_str)
                 else:
                     error_log("Missing password or random_data, cannot save account details to Excel.")
+                    raise ValueError("Missing critical data for account saving after CAPTCHA.") # Propagate error
 
                 ok_button_locator = page.get_by_role("button", name="OK")
                 # Fallback selector if get_by_role doesn't work: page.locator("button:has-text('OK')")
@@ -552,7 +546,6 @@ async def main():
                         warning_log(f"Error waiting for load state after clicking OK on notice: {e_load}. Proceeding.")
                 else:
                     warning_log("'OK' button not found on the notice page. Trying to proceed.")
-                    await page.screenshot(path=f"notice_ok_button_not_found_{random_data.get('email_username', 'unknown')}.png")
             
             elif "account.microsoft.com" in current_url and "verify" in current_url.lower():
                  warning_log(f"Landed on a verification page unexpectedly: {current_url}. This might indicate an unsolved CAPTCHA or other challenge.")
@@ -562,11 +555,29 @@ async def main():
 
         except Exception as e:
             error_log(f"Error interacting with name and family input OR on the subsequent notice/final page: {e}")
+            raise # Propagate the error
         finally:
-            info_log("Account creation attempt finished for this iteration. Closing browser.")
-            await page.wait_for_timeout(3000) # Brief pause before closing browser.
-            await browser.close()
-            # No explicit return needed here, end of function implies return
+            info_log("Account creation attempt finished for this iteration. Preparing to close browser resources.")
+            if 'page' in locals() and page and not page.is_closed():
+                info_log("Waiting for 3 seconds before closing page.")
+                await page.wait_for_timeout(3000) # Brief pause before closing page.
+                try:
+                    await page.close()
+                    info_log("Page closed successfully.")
+                except Exception as e_page_close:
+                    error_log(f"Error closing page: {e_page_close}")
+            else:
+                info_log("Page was not initialized or already closed.")
+
+            if 'browser' in locals() and browser and browser.is_connected():
+                info_log("Closing browser.")
+                try:
+                    await browser.close()
+                    info_log("Browser closed successfully.")
+                except Exception as e_browser_close:
+                    error_log(f"Error closing browser: {e_browser_close}")
+            else:
+                info_log("Browser was not initialized or already disconnected.")
 
 # this code will run the main function
 if __name__ == "__main__":
