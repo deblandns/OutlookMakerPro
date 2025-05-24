@@ -13,6 +13,8 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 import openpyxl
 from openpyxl import Workbook
 from openpyxl.utils.exceptions import InvalidFileException # For checking if file is valid excel
+import pyautogui
+import pygetwindow
 
 # the logger configs
 info_log = logger.info
@@ -123,6 +125,115 @@ RETRY_WAIT = wait_exponential(multiplier=1, min=1, max=5) # Wait 1s, then 2s, th
 RETRY_STOP = stop_after_attempt(3) # Try 3 times in total
 RETRY_ON_EXCEPTION = retry_if_exception_type(PlaywrightTimeoutError)
 
+async def os_mouse_to_element_center(page, locator, duration_seconds=0.5):
+    """Moves the OS mouse cursor to the center of the given Playwright locator."""
+    info_log(f"DEBUG_OS_MOUSE: Attempting OS-level mouse move to center of locator: {locator}")
+    try:
+        bounding_box = await locator.bounding_box()
+        if not bounding_box:
+            warning_log(f"DEBUG_OS_MOUSE: Cannot get bounding_box for OS mouse move for locator: {locator}. Skipping OS move.")
+            return False
+        info_log(f"DEBUG_OS_MOUSE: Bounding box found: {bounding_box}")
+
+        element_center_x_viewport = bounding_box['x'] + bounding_box['width'] / 2
+        element_center_y_viewport = bounding_box['y'] + bounding_box['height'] / 2
+        info_log(f"DEBUG_OS_MOUSE: Element viewport center: X={element_center_x_viewport:.0f}, Y={element_center_y_viewport:.0f}")
+
+        page_title = await page.title()
+        info_log(f"DEBUG_OS_MOUSE: Page title from Playwright: '{page_title}'")
+
+        browser_window = None
+        if not page_title:
+            info_log("DEBUG_OS_MOUSE: Page title is empty. Attempting fallback to find browser window.")
+            all_windows = pygetwindow.getAllWindows()
+            info_log(f"DEBUG_OS_MOUSE: Fallback - Found {len(all_windows)} total windows.")
+            potential_browsers = [w for w in all_windows if w.visible and w.width > 300 and w.height > 300]
+            info_log(f"DEBUG_OS_MOUSE: Fallback - Found {len(potential_browsers)} potential browser windows.")
+            if not potential_browsers:
+                warning_log("DEBUG_OS_MOUSE: Fallback - Could not find any suitable potential browser window. Skipping OS move.")
+                return False
+            browser_window = potential_browsers[0] 
+            info_log(f"DEBUG_OS_MOUSE: Fallback - Selected browser window: '{browser_window.title}' L:{browser_window.left}, T:{browser_window.top}, W:{browser_window.width}, H:{browser_window.height}")
+        else:
+            windows = pygetwindow.getWindowsWithTitle(page_title)
+            info_log(f"DEBUG_OS_MOUSE: Found {len(windows)} windows matching title '{page_title}': {windows}")
+            if windows:
+                for i, win in enumerate(windows):
+                    # Safely get attributes for logging, defaulting to False or None if not present
+                    is_active_log = getattr(win, 'isActive', False)
+                    is_maximized_log = getattr(win, 'isMaximized', False)
+                    is_visible_log = getattr(win, 'visible', False) # Changed to win.visible
+                    win_left_log = getattr(win, 'left', 'N/A')
+                    win_top_log = getattr(win, 'top', 'N/A')
+                    info_log(f"DEBUG_OS_MOUSE: Window {i} - Title: '{win.title}', Active: {is_active_log}, Maximized: {is_maximized_log}, Visible: {is_visible_log}, L:{win_left_log}, T:{win_top_log}")
+                    
+                    # Use getattr for conditions too, to be safe, and use win.visible
+                    is_active = getattr(win, 'isActive', False)
+                    is_maximized = getattr(win, 'isMaximized', False)
+                    is_actually_visible = getattr(win, 'visible', False) # Changed to win.visible
+
+                    if is_actually_visible and (is_active or is_maximized): # Prioritize visible and active/maximized
+                        if browser_window is None: 
+                           browser_window = win
+                           info_log(f"DEBUG_OS_MOUSE: Selected window (priority - active/maximized & visible): '{win.title}' L:{getattr(win, 'left', 'N/A')}, T:{getattr(win, 'top', 'N/A')}")
+                
+                # Fallback if no active/maximized visible window was found, but some windows matching title exist
+                if not browser_window and windows:
+                    # Try to find any simply visible window from the list first
+                    for i, win in enumerate(windows):
+                        if getattr(win, 'visible', False):
+                            browser_window = win
+                            info_log(f"DEBUG_OS_MOUSE: Selected window (fallback - first visible): '{win.title}' L:{getattr(win, 'left', 'N/A')}, T:{getattr(win, 'top', 'N/A')}")
+                            break
+                    # If still no browser_window (e.g. none were visible), take the first one from the original list as a last resort
+                    if not browser_window:
+                        browser_window = windows[0]
+                        info_log(f"DEBUG_OS_MOUSE: Selected window (fallback - truly first in list, visibility uncertain): '{browser_window.title}' L:{getattr(browser_window, 'left', 'N/A')}, T:{getattr(browser_window, 'top', 'N/A')}")
+        
+        if not browser_window:
+            warning_log(f"DEBUG_OS_MOUSE: Could not find/select browser window (title: '{page_title}'). Skipping OS move.")
+            return False
+        
+        info_log(f"DEBUG_OS_MOUSE: Final selected browser window: Title: '{browser_window.title}', L:{browser_window.left}, T:{browser_window.top}, W:{browser_window.width}, H:{browser_window.height}")
+
+        window_left, window_top = browser_window.left, browser_window.top
+
+        browser_chrome_height_estimate = 80 
+        info_log(f"DEBUG_OS_MOUSE: Using browser chrome height estimate: {browser_chrome_height_estimate}")
+
+        screen_x = window_left + element_center_x_viewport
+        screen_y = window_top + browser_chrome_height_estimate + element_center_y_viewport
+        info_log(f"DEBUG_OS_MOUSE: Calculated OS screen coords: X={screen_x:.0f}, Y={screen_y:.0f}")
+        
+        # For safety during debugging, let's check if coords are wildly off (e.g., negative)
+        if screen_x < 0 or screen_y < 0:
+            warning_log(f"DEBUG_OS_MOUSE: Calculated screen coordinates are negative ({screen_x}, {screen_y}). This is likely an error. Skipping OS move.")
+            return False
+        
+        # Also check against screen size if possible
+        try:
+            s_width, s_height = pyautogui.size()
+            info_log(f"DEBUG_OS_MOUSE: Screen size from PyAutoGUI: Width={s_width}, Height={s_height}")
+            if screen_x >= s_width or screen_y >= s_height:
+                warning_log(f"DEBUG_OS_MOUSE: Calculated screen coordinates ({screen_x}, {screen_y}) are outside screen bounds ({s_width}, {s_height}). Skipping OS move.")
+                return False
+        except Exception as e_screen_size:
+            warning_log(f"DEBUG_OS_MOUSE: Could not get screen size from PyAutoGUI: {e_screen_size}. Proceeding with move cautiously.")
+
+
+        info_log(f"DEBUG_OS_MOUSE: Calling pyautogui.moveTo({screen_x:.0f}, {screen_y:.0f}, duration={duration_seconds})")
+        pyautogui.moveTo(screen_x, screen_y, duration=duration_seconds)
+        success_log(f"DEBUG_OS_MOUSE: OS mouse move call completed for locator: {locator}. Current OS mouse pos: {pyautogui.position()}")
+        return True
+
+    except NotImplementedError as e:
+        # This can happen on some OS/environments where pyautogui can't get screen info or control mouse
+        error_log(f"PyAutoGUI NotImplementedError during OS-level mouse move: {e}. This feature may not work on your system.")
+        return False
+    except Exception as e:
+        error_log(f"Error during OS-level mouse move for locator {locator}: {e}")
+        return False
+
 # Helper functions with tenacity
 @tenacity_retry(wait=RETRY_WAIT, stop=RETRY_STOP, retry=RETRY_ON_EXCEPTION)
 async def robust_goto(page, url, **kwargs):
@@ -138,41 +249,64 @@ async def robust_wait_for_selector(page, selector, **kwargs):
     return element
 
 @tenacity_retry(wait=RETRY_WAIT, stop=RETRY_STOP, retry=RETRY_ON_EXCEPTION)
-async def robust_hover(page, locator, **kwargs):
-    info_log(f"Attempting to move mouse over locator '{locator}' with retries...")
+async def robust_hover(page, locator, use_os_mouse_move=False, os_mouse_duration=0.5, **kwargs):
+    info_log(f"Attempting to hover locator '{locator}' with human-like steps...")
+
+    if use_os_mouse_move:
+        info_log(f"Pre-hover: Initiating OS-level mouse move for locator '{locator}'")
+        await os_mouse_to_element_center(page, locator, duration_seconds=os_mouse_duration)
+        # Optional: Short delay after OS mouse movement for stability before Playwright takes over
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+
+    # Proceed with Playwright's hover logic
     try:
         await locator.scroll_into_view_if_needed(timeout=5000) # Scroll into view first
     except Exception as e:
-        warning_log(f"Failed to scroll locator '{locator}' into view for hover: {e}. Proceeding with hover attempt.")
+        warning_log(f"Failed to scroll locator '{locator}' into view for Playwright hover: {e}. Proceeding with hover attempt.")
 
-    # Get the bounding box of the element
     bounding_box = await locator.bounding_box()
     if bounding_box:
-        # Calculate the center of the element
-        x = bounding_box['x'] + bounding_box['width'] / 2
-        y = bounding_box['y'] + bounding_box['height'] / 2
-        # Move the mouse to the center of the element
-        await page.mouse.move(x, y)
-        success_log(f"Successfully moved mouse over locator '{locator}'")
+        target_x = bounding_box['x'] + bounding_box['width'] / 2
+        target_y = bounding_box['y'] + bounding_box['height'] / 2
+        
+        num_steps = kwargs.get('steps', 5) 
+        info_log(f"Playwright mouse moving to ({target_x:.0f}, {target_y:.0f}) in {num_steps} steps for locator '{locator}'.")
+        await page.mouse.move(target_x, target_y, steps=num_steps)
+        
+        success_log(f"Successfully hovered (Playwright) over locator '{locator}'")
     else:
-        # Fallback or error if bounding_box is None (element might not be visible/attached)
-        warning_log(f"Could not get bounding_box for locator '{locator}'. Falling back to hover().")
+        warning_log(f"Could not get bounding_box for Playwright hover on locator '{locator}'. Falling back to locator.hover().")
         try:
-            await locator.scroll_into_view_if_needed(timeout=5000) # Ensure in view for fallback too
+            await locator.scroll_into_view_if_needed(timeout=5000)
         except Exception as e:
-            warning_log(f"Failed to scroll locator '{locator}' into view for fallback hover: {e}")
-        await locator.hover(**kwargs) # fallback to original hover
-        success_log(f"Successfully hovered over locator '{locator}' (fallback)")
+            warning_log(f"Failed to scroll locator '{locator}' into view for fallback Playwright hover: {e}")
+        await locator.hover(**{k: v for k, v in kwargs.items() if k not in ('use_os_mouse_move', 'os_mouse_duration')}) # fallback
+        success_log(f"Successfully hovered (Playwright fallback) over locator '{locator}'")
 
 @tenacity_retry(wait=RETRY_WAIT, stop=RETRY_STOP, retry=RETRY_ON_EXCEPTION)
-async def robust_click(locator, **kwargs):
-    info_log(f"Attempting to click locator '{locator}' with retries...")
+async def robust_click(locator, use_os_mouse_move=False, os_mouse_duration=0.5, **kwargs):
+    page = locator.page # Get the page object from the locator
+    info_log(f"Attempting to human-like hover and click locator '{locator}' (OS mouse: {use_os_mouse_move})...")
+
+    # Perform a Playwright-controlled human-like hover first.
+    # This hover will internally handle the OS mouse move if use_os_mouse_move is True.
+    await robust_hover(page, locator, use_os_mouse_move=use_os_mouse_move, os_mouse_duration=os_mouse_duration, steps=kwargs.get('hover_steps', 5))
+    
+    # Short delay between hover and click, can be randomized
+    await asyncio.sleep(random.uniform(0.1, 0.3)) 
+
+    # Proceed with the click
+    info_log(f"Performing Playwright click on locator '{locator}'")
     try:
-        await locator.scroll_into_view_if_needed(timeout=5000)
+        # Ensure it's still in view; robust_hover should have handled scrolling, but a quick check is okay.
+        await locator.scroll_into_view_if_needed(timeout=2000) 
     except Exception as e:
-        warning_log(f"Failed to scroll locator '{locator}' into view for click: {e}. Proceeding with click attempt.")
-    await locator.click(**kwargs)
-    success_log(f"Successfully clicked locator '{locator}'")
+        warning_log(f"Failed to scroll locator '{locator}' into view just before click (should be minor): {e}. Proceeding with click attempt.")
+    
+    # Pass original kwargs except those handled by robust_hover or specific to robust_click's OS move logic
+    click_kwargs = {k: v for k, v in kwargs.items() if k not in ('hover_steps', 'use_os_mouse_move', 'os_mouse_duration')}
+    await locator.click(**click_kwargs) 
+    success_log(f"Successfully clicked (Playwright) locator '{locator}'")
 
 @tenacity_retry(wait=RETRY_WAIT, stop=RETRY_STOP, retry=RETRY_ON_EXCEPTION)
 async def robust_type(locator, text, **kwargs):
@@ -273,11 +407,11 @@ async def main():
         try:
             # Best practice: Hover to simulate mouse movement
             info_log("Hovering over the email input.")
-            await robust_hover(page, email_input, timeout=5000) # Wait up to 5s for hover
+            await robust_hover(page, email_input, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000) # Wait up to 5s for hover
             # Best practice: Click to focus (fill also does this, but explicit click is fine)
             info_log("Clicking the email input.")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(email_input, timeout=5000) # Wait up to 5s for click
+            await robust_click(email_input, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000) # Wait up to 5s for click
             # Type the email into the input field, simulating human behavior
             info_log(f"Attempting to type email: {random_data['email_username']}") # Updated log message
             await asyncio.sleep(random.uniform(1.0, 3.0))
@@ -289,11 +423,11 @@ async def main():
             info_log(f"Attempting to find 'Next' button with selector: {next_button_selector}")
             # Hover to simulate human-like mouse movement
             info_log("Hovering over the 'Next' button.")
-            await robust_hover(page, next_button, timeout=5000)  # Wait up to 5 seconds for hover
+            await robust_hover(page, next_button, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)  # Wait up to 5 seconds for hover
             # Click the 'Next' button
             info_log("Clicking the 'Next' button.")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(next_button, timeout=5000)  # Wait up to 5 seconds for click
+            await robust_click(next_button, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)  # Wait up to 5 seconds for click
             success_log("Successfully clicked the 'Next' button.")
             
             info_log("Waiting for the next page to load (password page expected).")
@@ -318,19 +452,19 @@ async def main():
             password_input_locator = page.locator(password_selector)
             password_to_save = generate_strong_password() # Assign the generated password
             info_log("Hovering over the password input.")
-            await robust_hover(page, password_input_locator, timeout=5000)
+            await robust_hover(page, password_input_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             info_log("Clicking the password input.")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(password_input_locator, timeout=5000)
+            await robust_click(password_input_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             info_log(f"Attempting to type password...") # Removed password from log for security
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_type(password_input_locator, text=password_to_save, delay=random.uniform(90, 300), timeout=15000) # Use password_to_save
             next_button_password_selector = "[data-testid='primaryButton']"
             next_button_password = page.locator(next_button_password_selector)
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_hover(page, next_button_password, timeout=5000)
+            await robust_hover(page, next_button_password, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(next_button_password, timeout=5000)
+            await robust_click(next_button_password, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             success_log("Successfully clicked the 'Next' button after password input.")
             info_log("Waiting for the birth date page to load.")
             try:
@@ -354,7 +488,7 @@ async def main():
             info_log(f"Attempting to select birth month: {birth_month_value}")
             month_dropdown_locator = page.locator(month_selector)
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_hover(page, month_dropdown_locator, timeout=5000)
+            await robust_hover(page, month_dropdown_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_select_option(month_dropdown_locator, value=birth_month_value)
             success_log(f"Successfully selected birth month: {birth_month_value}")
@@ -367,7 +501,7 @@ async def main():
             birth_day_value = str(birth_date_obj.day) # birth_date_obj is already defined
             info_log(f"Attempting to select birth day: {birth_day_value}")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_hover(page, day_dropdown_locator, timeout=5000)
+            await robust_hover(page, day_dropdown_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_select_option(day_dropdown_locator, value=birth_day_value)
             success_log(f"Successfully selected birth day: {birth_day_value}")
@@ -380,9 +514,9 @@ async def main():
             birth_year_value = str(birth_date_obj.year) # birth_date_obj is already defined
             info_log(f"Attempting to input birth year: {birth_year_value}")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_hover(page, year_input_locator, timeout=5000)
+            await robust_hover(page, year_input_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(year_input_locator, timeout=5000)
+            await robust_click(year_input_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_type(year_input_locator, text=birth_year_value, delay=random.uniform(90, 250))
             success_log(f"Successfully inputted birth year: {birth_year_value}")
@@ -392,10 +526,10 @@ async def main():
             next_button_birthdate = page.locator(next_button_birthdate_selector)
             info_log(f"Found 'Next' button with selector: {next_button_birthdate_selector}")
             info_log("Hovering over the 'Next' button (after birth date).")
-            await robust_hover(page, next_button_birthdate, timeout=5000)
+            await robust_hover(page, next_button_birthdate, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             info_log("Clicking the 'Next' button (after birth date).")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(next_button_birthdate, timeout=5000)
+            await robust_click(next_button_birthdate, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             success_log("Successfully clicked the 'Next' button after birth date input.")
 
             info_log("Waiting for the name input page to load.")
@@ -418,9 +552,9 @@ async def main():
             user_first_name = random_data['first_name']
             info_log(f"Attempting to input first name: {user_first_name}")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_hover(page, first_name_input_locator, timeout=5000)
+            await robust_hover(page, first_name_input_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(first_name_input_locator, timeout=5000)
+            await robust_click(first_name_input_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_type(first_name_input_locator, text=user_first_name, delay=random.uniform(90, 250))
             success_log(f"Successfully inputted first name: {user_first_name}")
@@ -432,9 +566,9 @@ async def main():
             user_last_name = random_data['last_name']
             info_log(f"Attempting to input last name: {user_last_name}")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_hover(page, last_name_input_locator, timeout=5000)
+            await robust_hover(page, last_name_input_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(last_name_input_locator, timeout=5000)
+            await robust_click(last_name_input_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await robust_type(last_name_input_locator, text=user_last_name, delay=random.uniform(90, 250))
             success_log(f"Successfully inputted last name: {user_last_name}")
@@ -444,46 +578,104 @@ async def main():
             next_button_name = page.locator(next_button_name_selector)
             info_log(f"Found 'Next' button with selector: {next_button_name_selector}")
             info_log("Hovering over the 'Next' button (after name input).")
-            await robust_hover(page, next_button_name, timeout=5000)
+            await robust_hover(page, next_button_name, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             info_log("Clicking the 'Next' button (after name input).")
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await robust_click(next_button_name, timeout=5000)
+            await robust_click(next_button_name, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000)
             success_log("Successfully clicked the 'Next' button after name input.")
             
-            # --- Enhanced CAPTCHA Detection ---
-            info_log("Checking for CAPTCHA page...")
-            # Option 1: Check for the "Solve puzzle" button (already in your code, made more robust)
-            solve_puzzle_button = page.get_by_role("button", name="Solve puzzle")
-            # Option 2: Check for the Arkose Labs iframe
-            captcha_iframe_selector = "iframe[data-testid='enforcementFrame']" # As seen in data.html
-            captcha_iframe = page.locator(captcha_iframe_selector)
-
-            # Give the page a moment to fully render CAPTCHA elements if they are appearing
-            await page.wait_for_timeout(10000) # 10 seconds, adjust if needed
-
-            is_captcha_visible = False
             try:
-                if await solve_puzzle_button.is_visible(timeout=5000): # Check if button is visible within 5s
-                    is_captcha_visible = True
-                    info_log("CAPTCHA detected: 'Solve puzzle' button is visible.")
-                elif await captcha_iframe.is_visible(timeout=5000): # Check if iframe is visible within 5s
-                    is_captcha_visible = True
-                    info_log("CAPTCHA detected: Arkose Labs iframe is visible.")
-                elif await page.locator("h2:has-text('Let\\'s prove you\\'re human')").is_visible(timeout=3000):
-                    is_captcha_visible = True
-                    info_log("CAPTCHA detected: 'Let\\'s prove you\\'re human' heading is visible.")
-                else:
-                    # As a fallback, check if the iframe exists in the DOM, even if not immediately visible
-                    if await captcha_iframe.count() > 0:
-                        is_captcha_visible = True
-                        warning_log("CAPTCHA potentially present: Arkose Labs iframe found in DOM, but might not be visible yet.")
-                    else:
-                        info_log("No clear CAPTCHA elements detected within timeout.")
-            except PlaywrightTimeoutError:
-                info_log("Timeout while checking for CAPTCHA elements. Assuming no CAPTCHA or page not loaded as expected.")
-            except Exception as e_captcha_check:
-                error_log(f"Error during CAPTCHA check: {e_captcha_check}")
+                # --- Enhanced CAPTCHA Detection ---
+                info_log("Checking for CAPTCHA page...")
+                # Give the page a moment to settle before starting checks
+                await page.wait_for_timeout(3000) 
 
+                is_captcha_visible = False
+                captcha_detection_reason = "No specific CAPTCHA element detected by any method."
+
+                # Check 1: "Solve puzzle" button
+                if not is_captcha_visible:
+                    try:
+                        solve_puzzle_button = page.get_by_role("button", name="Solve puzzle")
+                        if await solve_puzzle_button.is_visible(timeout=1000):
+                            is_captcha_visible = True
+                            captcha_detection_reason = "'Solve puzzle' button is visible."
+                    except PlaywrightTimeoutError:
+                        info_log("Timeout checking for 'Solve puzzle' button.")
+                    except Exception as e:
+                        warning_log(f"Error checking for 'Solve puzzle' button: {e}")
+                
+                # Check 2: Specific Arkose Labs iframe (data-testid='enforcementFrame')
+                if not is_captcha_visible:
+                    try:
+                        arkose_iframe = page.locator("iframe[data-testid='enforcementFrame']")
+                        if await arkose_iframe.is_visible(timeout=1000):
+                            is_captcha_visible = True
+                            captcha_detection_reason = "Arkose Labs iframe (enforcementFrame) is visible."
+                        elif await arkose_iframe.count() > 0: # Check if it exists in DOM even if not visible
+                            is_captcha_visible = True # Assuming its presence means a CAPTCHA
+                            captcha_detection_reason = "Arkose Labs iframe (enforcementFrame) found in DOM (may not be immediately visible)."
+                    except PlaywrightTimeoutError:
+                        info_log("Timeout checking for Arkose Labs enforcementFrame.")
+                    except Exception as e:
+                        warning_log(f"Error checking for Arkose Labs enforcementFrame: {e}")
+
+                # Check 3: "Let's prove you're human" heading (h1)
+                if not is_captcha_visible:
+                    try:
+                        human_proof_heading = page.locator("h1:has-text('Let\'s prove you\'re human')")
+                        if await human_proof_heading.is_visible(timeout=1000):
+                            is_captcha_visible = True
+                            captcha_detection_reason = "'Let\'s prove you\'re human' (h1) heading is visible."
+                    except PlaywrightTimeoutError:
+                        info_log("Timeout checking for 'Let\'s prove you\'re human' heading.")
+                    except Exception as e:
+                        warning_log(f"Error checking for 'Let\'s prove you\'re human' heading: {e}")
+                
+                # Check 4: Other common CAPTCHA-related headings (e.g., h2)
+                if not is_captcha_visible:
+                    try:
+                        # Example: Look for "Please solve this puzzle" or similar text in an h2
+                        # This can be expanded with other common phrases
+                        puzzle_heading_h2 = page.locator("h2:has-text('Please solve this puzzle'i)") # Case-insensitive
+                        if await puzzle_heading_h2.is_visible(timeout=1000):
+                            is_captcha_visible = True
+                            captcha_detection_reason = "Common puzzle/verification heading (h2) is visible."
+                    except PlaywrightTimeoutError:
+                        info_log("Timeout checking for common puzzle/verification heading (h2).")
+                    except Exception as e:
+                        warning_log(f"Error checking for common puzzle/verification heading (h2): {e}")
+
+                # Check 5: Generic CAPTCHA iframes by title keywords or src attributes
+                if not is_captcha_visible:
+                    captcha_iframe_selectors = ["iframe[title*='challenge'i]", "iframe[title*='verification'i]", "iframe[title*='captcha'i]", "iframe[title*='security'i]", "iframe[title*='puzzle'i]", "iframe[src*='hcaptcha.com'i]", "iframe[src*='recaptcha.net'i]", "iframe[src*='google.com/recaptcha'i]", "iframe[src*='arkoselabs.com'i]", "iframe[src*='funcaptcha.com'i]", "iframe[src*='hsprotect.net']"]
+                    try:
+                        for selector in captcha_iframe_selectors:
+                            matching_iframes = page.locator(selector)
+                            count = await matching_iframes.count()
+                            for i in range(count):
+                                iframe_candidate = matching_iframes.nth(i)
+                                # Use a very short timeout here as we are iterating
+                                if await iframe_candidate.is_visible(timeout=500): 
+                                    is_captcha_visible = True
+                                    captcha_detection_reason = f"Generic CAPTCHA iframe visible (selector: {selector}, instance {i+1})."
+                                    break # Break from inner loop (checking instances of current selector)
+                            if is_captcha_visible:
+                                break # Break from outer loop (checking different selectors)
+                    except PlaywrightTimeoutError:
+                        info_log("Timeout during generic CAPTCHA iframe checks.")
+                    except Exception as e:
+                        warning_log(f"Error during generic CAPTCHA iframe checks: {e}")
+                
+                if is_captcha_visible:
+                    info_log(f"CAPTCHA DETECTED: {captcha_detection_reason}")
+                else:
+                    info_log("CAPTCHA NOT DETECTED based on current checks.")
+            
+            except Exception as e_captcha_outer:
+                # This catches errors not caught by inner try-except blocks, or if initial page.wait_for_timeout fails
+                error_log(f"An unexpected error occurred in the outer CAPTCHA detection block: {e_captcha_outer}")
+                raise
 
             if is_captcha_visible:
                 info_log("CAPTCHA page is loaded.")
@@ -512,8 +704,7 @@ async def main():
                     raise # Propagate the error
             else:
                 info_log("CAPTCHA page not detected. Proceeding as if no CAPTCHA was presented.")
-                # If no CAPTCHA, you might land directly on the notice page or elsewhere.
-                # The script will proceed to the post-CAPTCHA logic.
+                
 
             # --- Check for privacy notice page (or other outcomes) AFTER manual CAPTCHA or if no CAPTCHA ---
             current_url = page.url
@@ -534,24 +725,29 @@ async def main():
                 # Fallback selector if get_by_role doesn't work: page.locator("button:has-text('OK')")
                 if await ok_button_locator.is_visible(timeout=10000):
                     info_log("Clicking 'OK' on the Microsoft account notice page.")
-                    await robust_hover(page, ok_button_locator, timeout=5000) # Hover before click
-                    await robust_click(ok_button_locator)
+                    await robust_hover(page, ok_button_locator, use_os_mouse_move=True, os_mouse_duration=0.7, timeout=5000) # Hover before click
+                    await robust_click(ok_button_locator, use_os_mouse_move=True, os_mouse_duration=0.7)
                     # Wait for page to potentially change/settle after clicking OK
                     try:
                         await robust_wait_for_load_state(page, 'domcontentloaded', timeout=10000)
                         success_log("Successfully clicked 'OK' and notice page processed.")
                     except PlaywrightTimeoutError:
                         info_log("Page did not fully reload or change after clicking OK on notice, but proceeding.")
+                        raise
                     except Exception as e_load:
                         warning_log(f"Error waiting for load state after clicking OK on notice: {e_load}. Proceeding.")
+                        raise
                 else:
                     warning_log("'OK' button not found on the notice page. Trying to proceed.")
+                    raise
             
             elif "account.microsoft.com" in current_url and "verify" in current_url.lower():
                  warning_log(f"Landed on a verification page unexpectedly: {current_url}. This might indicate an unsolved CAPTCHA or other challenge.")
+                 raise
 
             else:
                 warning_log(f"Did not land on the expected Microsoft account notice page. Current URL: {current_url}, Title: {page_title}")
+                raise
 
         except Exception as e:
             error_log(f"Error interacting with name and family input OR on the subsequent notice/final page: {e}")
